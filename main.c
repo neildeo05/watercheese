@@ -8,11 +8,18 @@
 
 #include <Hypervisor/Hypervisor.h>
 
+typedef uint64_t excp_syndrome_t;
+#define EC(syndrome) ((syndrome >> 26) & 0x3f)
+#define EC_HVC 0x16
+#define EC_SMC 0x17
+#define EC_BRK 0x3C
 /* Memory Map
-   - from 0x8000_0000 to 0xF000_0000 (16 MiB) is the main RAM
+   - from 0x8000_0000 to 0x8000_0000 (16 MiB) is the main RAM
      - User Stack Pointer is at +0x4000
      - Kernel Stack Pointer is at +0x8000
  */
+const uint64_t gp_MainMemory = 0x80000000;
+const uint64_t gp_MainMemorySize = 0x1000000;
 
 // Since post-reset the CPU starts in EL0, in order to start in EL1, we need to do a supervisor call
 const char s_cArm64ResetVector[] = {
@@ -38,49 +45,43 @@ const char s_ckVMCode[] = {
 };
 
 // Overview of this memory layout:
-// Main memory starts at 0x80000000
-// Reset VBAR_EL1 at 0xF0000000 - 0xF0010000;
-// Reset trampoline code at 0xF0000800
-const uint64_t g_kAdrResetTrampoline = 0xF0000000;
-const uint64_t g_szResetTrampolineMemory = 0x10000;
+// The EL1 vector table is between [0xF0000000, 0xF0000800]; (reset trampoline is placed in every entry of the vector table)
+// It contains 16 0x80 byte slots that have instructions that run given a specifc trap vector
+// Reset vector code at 0xF0000800, PC starts there initially
+// https://wiki.osdev.org/AArch64_Exceptions
+const uint64_t gp_EL1VecTable = 0xF0000000;
+const uint64_t gp_VecTableRegionSize = 0x10000;
 
-const uint64_t g_kAdrMainMemory = 0x80000000;
-const uint64_t g_szMainMemSize = 0x1000000;
 
-void* g_pResetTrampolineMemory = NULL;
-void* g_pMainMemory = NULL;
+void* ResetTrampoline = NULL;
+void* MainMemory = NULL;
 
-int VmpPrepareSystemMemory()
+int InitMemory()
 {
-    // Reset trampoline
-    // Well, dear Apple, why you reset the CPU at EL0
-    posix_memalign(&g_pResetTrampolineMemory, 0x10000, g_szResetTrampolineMemory);
-    if (g_pResetTrampolineMemory == NULL) {
+    // Populate the entire vector table with the reset trampoline
+    posix_memalign(&ResetTrampoline, 0x10000, gp_VecTableRegionSize);
+    if (ResetTrampoline == NULL) {
         return -ENOMEM;
     }
-
-    memset(g_pResetTrampolineMemory, 0, g_szResetTrampolineMemory);
+    memset(ResetTrampoline, 0, gp_VecTableRegionSize);
     for (uint64_t offset = 0; offset < 0x780; offset += 0x80) {
-        memcpy((void*) g_pResetTrampolineMemory + offset, s_cArm64ResetTramp, sizeof(s_cArm64ResetTramp));
+        memcpy((void*) ResetTrampoline + offset, s_cArm64ResetTramp, sizeof(s_cArm64ResetTramp));
     }
+    // Place the reset vector at 0xF0000800
+    memcpy((void*) ResetTrampoline + 0x800, s_cArm64ResetVector, sizeof(s_cArm64ResetVector));
 
-    memcpy((void*) g_pResetTrampolineMemory + 0x800, s_cArm64ResetVector, sizeof(s_cArm64ResetVector));
+    // hvm_vm_map(host_pointer, guest_intermediate_physical_address, size, permissions)
+    // For the extended page tables, this maps guest physical [0xF0000000-0xF0010000] -> host physical ResetTrampoline
+    hv_vm_map(ResetTrampoline, gp_EL1VecTable, gp_VecTableRegionSize, HV_MEMORY_READ | HV_MEMORY_EXEC);
 
-    // Map the RAM into the VM
-    HYP_ASSERT_SUCCESS(hv_vm_map(g_pResetTrampolineMemory, g_kAdrResetTrampoline, g_szResetTrampolineMemory, HV_MEMORY_READ | HV_MEMORY_EXEC));
-
-    // Main memory.
-    posix_memalign(&g_pMainMemory, 0x1000, g_szMainMemSize);
-    if (g_pMainMemory == NULL) {
+    // Allocate main memory and map it guest physical [0x80000000, 0x8100_0000]
+    posix_memalign(&MainMemory, 0x1000, gp_MainMemorySize);
+    if (MainMemory == NULL) {
         return -ENOMEM;
     }
-
-    // Copy our code into the VM's RAM
-    memset(g_pMainMemory, 0, g_szMainMemSize);
-    memcpy(g_pMainMemory, s_ckVMCode, sizeof(s_ckVMCode));
-
-    // Map the RAM into the VM
-    HYP_ASSERT_SUCCESS(hv_vm_map(g_pMainMemory, g_kAdrMainMemory, g_szMainMemSize, HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC));
+    memset(MainMemory, 0, gp_MainMemorySize);
+    memcpy(MainMemory, s_ckVMCode, sizeof(s_ckVMCode));
+    hv_vm_map(MainMemory, gp_MainMemory, gp_MainMemorySize, HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC);
 
     return 0;
 }
@@ -88,106 +89,91 @@ int VmpPrepareSystemMemory()
 int main(int argc, const char * argv[])
 {
     hv_vcpu_t vcpu;
+    // Contains exit reasons, I am assuming similar to the VMCS exit reasons
     hv_vcpu_exit_t *vcpu_exit;
 
-    // Create the VM
-    HYP_ASSERT_SUCCESS(hv_vm_create(NULL));
-
-    // Prepare the memory layout
-    if (VmpPrepareSystemMemory()) {
-        abort();
-    }
+    hv_vm_create(NULL);
+    if (InitMemory()) abort();
     
-    // Add a virtual CPU to our VM
-    HYP_ASSERT_SUCCESS(hv_vcpu_create(&vcpu, &vcpu_exit, NULL));
-
-    // Configure initial VBAR_EL1 to the trampoline
-    HYP_ASSERT_SUCCESS(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_VBAR_EL1, g_kAdrResetTrampoline));
+    // Create a vCPU associated with the current host thread
+    hv_vcpu_create(&vcpu, &vcpu_exit, NULL);
+    // Set the vector table pointer to point to the guest physical address trampoline pointer
+    hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_VBAR_EL1, gp_EL1VecTable);
 
 #if USE_EL0_TRAMPOILNE
     // Set the CPU's PC to execute from the trampoline
-    HYP_ASSERT_SUCCESS(hv_vcpu_set_reg(vcpu, HV_REG_PC, g_kAdrResetTrampoline + 0x800));
+    hv_vcpu_set_reg(vcpu, HV_REG_PC, gp_EL1VecTable + 0x800);
 #else
-    // Or explicitly set CPSR
-    HYP_ASSERT_SUCCESS(hv_vcpu_set_reg(vcpu, HV_REG_CPSR, 0x3c4));
-    HYP_ASSERT_SUCCESS(hv_vcpu_set_reg(vcpu, HV_REG_PC, 0x80000000));
+    hv_vcpu_set_reg(vcpu, HV_REG_CPSR, 0x3c4);
+    hv_vcpu_set_reg(vcpu, HV_REG_PC, 0x80000000);
 #endif
 
-    // Configure misc
-    HYP_ASSERT_SUCCESS(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SP_EL0, g_kAdrMainMemory + 0x4000));
-    HYP_ASSERT_SUCCESS(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SP_EL1, g_kAdrMainMemory + 0x8000));
+    // Set the stack pointers for the EL0 and EL1
+    hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SP_EL0, gp_MainMemory + 0x4000);
+    hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SP_EL1, gp_MainMemory + 0x8000);
 
-    // Trap debug access (BRK)
-    HYP_ASSERT_SUCCESS(hv_vcpu_set_trap_debug_exceptions(vcpu, true));
+    // Force BRK instructions to trap
+    hv_vcpu_set_trap_debug_exceptions(vcpu, true);
 
-    // start the VM
-    while (true) {
-        // Run the VM until a VM exit
-        HYP_ASSERT_SUCCESS(hv_vcpu_run(vcpu));
-        // Check why we exited the VM
+    // Infinite loop for the VM's runtime
+    for (;;) {
+        // This call blocks until the VM exits
+        // I am assuming it traps into EL2, the hypervisor/lowvisor in EL2 world switches to the VM context on this thread
+        hv_vcpu_run(vcpu);
+        
+        // Decoede the exit reason
         if (vcpu_exit->reason == HV_EXIT_REASON_EXCEPTION) {
-            // Check if this is an HVC call
-            // https://developer.arm.com/docs/ddi0595/e/aarch64-system-registers/esr_el2
-            uint64_t syndrome = vcpu_exit->exception.syndrome;
-            uint8_t ec = (syndrome >> 26) & 0x3f;
-            // check Exception Class
-            if (ec == 0x16) {
-                // Exception Class 0x16 is
-                // "HVC instruction execution in AArch64 state, when HVC is not disabled."
-                uint64_t x0;
-                HYP_ASSERT_SUCCESS(hv_vcpu_get_reg(vcpu, HV_REG_X0, &x0));
-                printf("VM made an HVC call! x0 register holds 0x%llx\n", x0);
-                break;
-            } else if (ec == 0x17) {
-                // Exception Class 0x17 is
-                // "SMC instruction execution in AArch64 state, when SMC is not disabled."
-
-                // Yes despite M1 doesn't have EL3, it is capable to trap it too. :)
-                uint64_t x0;
-                HYP_ASSERT_SUCCESS(hv_vcpu_get_reg(vcpu, HV_REG_X0, &x0));
-                printf("VM made an SMC call! x0 register holds 0x%llx\n", x0);
-                printf("Return to get on next instruction.\n");
-
-                // ARM spec says trapped SMC have different return path, so it is required
-                // to increment elr_el2 by 4 (one instruction.)
-                uint64_t pc;
-                HYP_ASSERT_SUCCESS(hv_vcpu_get_reg(vcpu, HV_REG_PC, &pc));
-                pc += 4;
-                HYP_ASSERT_SUCCESS(hv_vcpu_set_reg(vcpu, HV_REG_PC, pc));
-            } else if (ec == 0x3C) {
-                // Exception Class 0x3C is BRK in AArch64 state
-                uint64_t x0;
-                HYP_ASSERT_SUCCESS(hv_vcpu_get_reg(vcpu, HV_REG_X0, &x0));
-                printf("VM made an BRK call!\n");
-                printf("Reg dump:\n");
-                for (uint32_t reg = HV_REG_X0; reg < HV_REG_X5; reg++) {
-                    uint64_t s;
-                    HYP_ASSERT_SUCCESS(hv_vcpu_get_reg(vcpu, reg, &s));
-                    printf("X%d: 0x%llx\n", reg, s);
+            // ESR_EL2 contains the syndrome for an exception to EL2
+            excp_syndrome_t syndrome = vcpu_exit->exception.syndrome;
+            printf("Excepction Code: %llx\n", EC(syndrome));
+            switch(EC(syndrome)) {
+                case EC_HVC: {
+                    uint64_t x0;
+                    hv_vcpu_get_reg(vcpu, HV_REG_X0, &x0);
+                    printf("VM made an HVC call! x0 register holds 0x%llx\n", x0);
+                    goto exit;
                 }
-                break;
-            } else {
-                fprintf(stderr, "Unexpected VM exception: 0x%llx, EC 0x%x, VirtAddr 0x%llx, IPA 0x%llx\n",
-                    syndrome,
-                    ec,
-                    vcpu_exit->exception.virtual_address,
-                    vcpu_exit->exception.physical_address
-                );
-                break;
+                case EC_SMC: {
+                    uint64_t pc;
+                    hv_vcpu_get_reg(vcpu, HV_REG_PC, &pc);
+                    pc += 4;
+                    hv_vcpu_set_reg(vcpu, HV_REG_PC, pc);
+                    break;
+                }
+                case EC_BRK: {
+                    uint64_t x0;
+                    hv_vcpu_get_reg(vcpu, HV_REG_X0, &x0);
+                    printf("VM made an BRK call!\n");
+                    printf("Reg dump:\n");
+                    for (uint32_t reg = HV_REG_X0; reg < HV_REG_X5; reg++) {
+                        uint64_t s;
+                        hv_vcpu_get_reg(vcpu, reg, &s);
+                        printf("X%d: 0x%llx\n", reg, s);
+                    }
+                    goto exit;
+                }
+                default: {
+                    fprintf(stderr, "Unexpected VM exception: 0x%llx, EC 0x%llx, GVA 0x%llx, GPA 0x%llx\n",
+                        syndrome,
+                        EC(syndrome),
+                        vcpu_exit->exception.virtual_address,
+                        vcpu_exit->exception.physical_address
+                    );
+                    goto exit;
+                }
             }
-        } else {
+        } 
+        else {
             fprintf(stderr, "Unexpected VM exit reason: %d\n", vcpu_exit->reason);
-            break;
+            goto exit;
         }
     }
-
-    // Tear down the VM
+exit:
+    printf("Exitting...\n");
     hv_vcpu_destroy(vcpu);
     hv_vm_destroy();
-
-    // Free memory
-    free(g_pResetTrampolineMemory);
-    free(g_pMainMemory);
+    free(ResetTrampoline);
+    free(MainMemory);
 
     return 0;
 }
