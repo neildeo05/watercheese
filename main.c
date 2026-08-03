@@ -1,5 +1,6 @@
 // Built from https://gist.github.com/imbushuo/51b09e61ecd7b7ac063853ad65cedf34
 #include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
@@ -8,6 +9,7 @@
 #include "util.h"
 #include <sys/mman.h>
 #include "watercheese_types.h"
+#include "io.h"
 
 #include <Hypervisor/Hypervisor.h>
 
@@ -29,7 +31,7 @@ void* MainMemory = NULL;
 
 int InitMemory()
 {
-    long page_size = sysconf(_SC_PAGESIZE); // Apparently macos can 
+    long page_size = sysconf(_SC_PAGESIZE);
     int err = posix_memalign(&MainMemory, page_size, RAM_SIZE);
     if (err != 0 || MainMemory == NULL) {
         return -ENOMEM;
@@ -38,10 +40,6 @@ int InitMemory()
     memset(MainMemory, 0, RAM_SIZE);
 #if WC_CUSTOM_PAYLOAD
     uintptr_t mm = (uintptr_t) MainMemory;
-    uintptr_t payload = mm+((PAYLOAD_BASE-RAM_BASE));
-    uintptr_t stack = mm+((STACK_BASE-RAM_BASE));
-    void* payload_p = (void*) payload;
-    void* stack_p = (void*) stack;
     uint8_t* code;
     char* payload_path = "guest/hvf_guest.bin";
     uint64_t codesz = read_payload(payload_path, &code);
@@ -49,11 +47,11 @@ int InitMemory()
         fprintf(stderr, "Code size and linker size disagree\n");
         return -EBADF;
     }
-    memcpy(payload_p, code, codesz);
+    memcpy((((uint8_t*) MainMemory) + (PAYLOAD_BASE - RAM_BASE)), code, codesz);
     free(code);
-    hv_vm_map(payload_p, PAYLOAD_BASE, PAYLOAD_SIZE, HV_MEMORY_READ | HV_MEMORY_EXEC);
-    hv_vm_map(stack_p, STACK_BASE, STACK_SIZE, HV_MEMORY_READ | HV_MEMORY_WRITE);
-
+    // we map all of main memory as RWX because so the guest can control the permissions themselves
+    // if a guest application accesses a region that it doesn't have permissions to do the OS should fault
+    hv_vm_map(MainMemory, RAM_BASE, RAM_SIZE, HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC);
 
 
 #else
@@ -75,6 +73,9 @@ int main(int argc, const char * argv[])
     // Create a vCPU associated with the current host thread
     hv_vcpu_create(&vcpu, &vcpu_exit, NULL);
 
+    // Set the P-state of the processor to be:
+    // 0x005 -> run at EL1
+    // 0x3C0 -> all interrupts masked initially
     hv_vcpu_set_reg(vcpu, HV_REG_CPSR, 0x3c5);
     hv_vcpu_set_reg(vcpu, HV_REG_PC, PAYLOAD_BASE);
 
@@ -144,17 +145,48 @@ int main(int argc, const char * argv[])
                 }
                 case EC_DATAABORT: {
                     // need to check that it is inside deferred RAM and DFSC is a translation fault
-#if WC_CUSTOM_PAYLOAD
                     uint64_t pa = vcpu_exit->exception.physical_address; // check faulting address
-                    if(pa >= DEFERRED_BASE && pa < DEFERRED_BASE + DEFERRED_SIZE && (DFSC(syndrome) >= 0x4) && (DFSC(syndrome) <= 0x7)) {
-                        // deferred memory should be mapped later
-                        void* deferred_pa = (uint8_t*)MainMemory + (DEFERRED_BASE - RAM_BASE);
-                        printf("Got a stage 2 fault at %llx, mapping to %p\n", pa, deferred_pa);
-                        hv_return_t r = hv_vm_map(deferred_pa, DEFERRED_BASE, DEFERRED_SIZE, HV_MEMORY_WRITE | HV_MEMORY_READ);
-                        if(r != HV_SUCCESS) goto exit;
-                        break;
+                    struct mmio_excp_payload p;
+                    uint8_t isv = ISV(syndrome);
+                    uint8_t s1ptw = S1PTW(syndrome);
+                    uint8_t cm = CM(syndrome);
+                    uint8_t dfsc = DFSC(syndrome);
+                    if((isv && !s1ptw && !cm) && dfsc >= 0x4 && dfsc <= 0x7) {
+                        uint64_t access_size = 1 << SAS(syndrome);
+                        // valid mmio access fault
+                        enum mmio_type mt = is_mmio_access(pa);
+                        switch(mt) {
+                            case UNDEF:
+                            case GICD:
+                            case GICR:
+                            case RTC:
+                            case VIRTIO: break;
+                            case PL011: {
+                                uint64_t offset = pa - UART_BASE;
+                                // ensure there is no access overflow and the access is addressed aligned
+                                if(access_size > (UART_SIZE - offset) || pa % access_size != 0) break;
+                                uint8_t is_write = WnR(syndrome);
+                                uint64_t reg_idx = SRT(syndrome);
+                                uint64_t write_val = 0;
+                                // reg_idx = 31 means the sourze is a XZR (always zero)
+                                if (is_write == 1 && reg_idx != 31) hv_vcpu_get_reg(vcpu, reg_idx, &write_val);
+                                write_val &= (UINT64_MAX >> ((sizeof(uint64_t) - access_size) * 8));
+
+                                struct mmio_excp_payload mp = {
+                                    .syndrome=syndrome,
+                                    .access_size=access_size,
+                                    .fault_gpa=pa,
+                                    .offset=offset,
+                                    .r_w=is_write,
+                                    .reg_idx=reg_idx,
+                                    .write_val=write_val,
+                                    .vcpu_id=0
+                                };
+                                handle_mmio(&mp);
+                            }
+                            default: break;
+                        }
                     }
-#endif
                     fprintf(stderr, "Unexpected VM exception: 0x%llx, EC 0x%x, GVA 0x%llx, GPA 0x%llx\n",
                         syndrome,
                         EC(syndrome),
