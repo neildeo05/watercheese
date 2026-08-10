@@ -29,8 +29,7 @@
 
 void* MainMemory = NULL;
 
-int InitMemory()
-{
+int InitMemory() {
     long page_size = sysconf(_SC_PAGESIZE);
     int err = posix_memalign(&MainMemory, page_size, RAM_SIZE);
     if (err != 0 || MainMemory == NULL) {
@@ -69,6 +68,7 @@ int main(int argc, const char * argv[])
 
     hv_vm_create(NULL);
     if (InitMemory()) abort();
+    if (InitIO()) abort();
     
     // Create a vCPU associated with the current host thread
     hv_vcpu_create(&vcpu, &vcpu_exit, NULL);
@@ -145,46 +145,45 @@ int main(int argc, const char * argv[])
                 }
                 case EC_DATAABORT: {
                     // need to check that it is inside deferred RAM and DFSC is a translation fault
+                    uint64_t pc;
+                    hv_vcpu_get_reg(vcpu, HV_REG_PC, &pc);
                     uint64_t pa = vcpu_exit->exception.physical_address; // check faulting address
-                    struct mmio_excp_payload p;
                     uint8_t isv = ISV(syndrome);
                     uint8_t s1ptw = S1PTW(syndrome);
                     uint8_t cm = CM(syndrome);
                     uint8_t dfsc = DFSC(syndrome);
                     if((isv && !s1ptw && !cm) && dfsc >= 0x4 && dfsc <= 0x7) {
+                        // MMIO access
                         uint64_t access_size = 1 << SAS(syndrome);
+                        uint64_t write_val = 0;
+                        uint8_t is_write = WnR(syndrome);
+                        uint64_t reg_idx = SRT(syndrome);
+                        if (is_write == 1 && reg_idx != 31) hv_vcpu_get_reg(vcpu, reg_idx_to_hv(reg_idx), &write_val);
+                        write_val &= (UINT64_MAX >> ((sizeof(uint64_t) - access_size) * 8));
                         // valid mmio access fault
-                        enum mmio_type mt = is_mmio_access(pa);
-                        switch(mt) {
-                            case UNDEF:
-                            case GICD:
-                            case GICR:
-                            case RTC:
-                            case VIRTIO: break;
-                            case PL011: {
-                                uint64_t offset = pa - UART_BASE;
-                                // ensure there is no access overflow and the access is addressed aligned
-                                if(access_size > (UART_SIZE - offset) || pa % access_size != 0) break;
-                                uint8_t is_write = WnR(syndrome);
-                                uint64_t reg_idx = SRT(syndrome);
-                                uint64_t write_val = 0;
-                                // reg_idx = 31 means the sourze is a XZR (always zero)
-                                if (is_write == 1 && reg_idx != 31) hv_vcpu_get_reg(vcpu, reg_idx, &write_val);
-                                write_val &= (UINT64_MAX >> ((sizeof(uint64_t) - access_size) * 8));
-
-                                struct mmio_excp_payload mp = {
-                                    .syndrome=syndrome,
-                                    .access_size=access_size,
-                                    .fault_gpa=pa,
-                                    .offset=offset,
-                                    .r_w=is_write,
-                                    .reg_idx=reg_idx,
-                                    .write_val=write_val,
-                                    .vcpu_id=0
-                                };
-                                handle_mmio(&mp);
+                        struct wc_vcpu_mmio_exit mx = {
+                            .syndrome=syndrome,
+                            .fault_gpa=pa,
+                            .guest_pc=pc,
+                            .write_value=write_val,
+                            .vcpu_id=0,
+                            .access_size=access_size,
+                            .reg_idx=reg_idx,
+                            .direction=is_write
+                        };
+                        struct wc_mmio_result res = handle_mmio(&mx);
+                        if(res.status == WC_STATUS_SUCCESS) {
+                            if(!is_write) {
+                                uint64_t out = res.read_value;
+                                if(reg_idx != 31) {
+                                    uint64_t mask = UINT64_MAX >> ((8U - access_size) * 8U);
+                                    out &= mask;
+                                    hv_vcpu_set_reg(vcpu, reg_idx_to_hv(reg_idx), out);
+                                }
                             }
-                            default: break;
+                            pc += 4;
+                            hv_vcpu_set_reg(vcpu, HV_REG_PC, &pc);
+                            break;
                         }
                     }
                     fprintf(stderr, "Unexpected VM exception: 0x%llx, EC 0x%x, GVA 0x%llx, GPA 0x%llx\n",

@@ -3,6 +3,7 @@
 #include <stdint.h>
 #include <assert.h>
 #include <stddef.h>
+#include <Hypervisor/hv_vcpu_types.h>
 
 #define WC_CUSTOM_PAYLOAD 1
 
@@ -115,6 +116,44 @@ enum WC_ec_type {
     EC_VECTORCATCH            = 0x3a,
     EC_AA64_BKPT              = 0x3c,
 };
+
+hv_reg_t reg_idx_to_hv(uint64_t reg_idx) {
+    switch(reg_idx) {
+        case 0: return HV_REG_X0;
+        case 1: return HV_REG_X1;
+        case 2: return HV_REG_X2;
+        case 3: return HV_REG_X3;
+        case 4: return HV_REG_X4;
+        case 5: return HV_REG_X5;
+        case 6: return HV_REG_X6;
+        case 7: return HV_REG_X7;
+        case 8: return HV_REG_X8;
+        case 9: return HV_REG_X9;
+        case 10: return HV_REG_X10;
+        case 11: return HV_REG_X11;
+        case 12: return HV_REG_X12;
+        case 13: return HV_REG_X13;
+        case 14: return HV_REG_X14;
+        case 15: return HV_REG_X15;
+        case 16: return HV_REG_X16;
+        case 17: return HV_REG_X17;
+        case 18: return HV_REG_X18;
+        case 19: return HV_REG_X19;
+        case 20: return HV_REG_X20;
+        case 21: return HV_REG_X21;
+        case 22: return HV_REG_X22;
+        case 23: return HV_REG_X23;
+        case 24: return HV_REG_X24;
+        case 25: return HV_REG_X25;
+        case 26: return HV_REG_X26;
+        case 27: return HV_REG_X27;
+        case 28: return HV_REG_X28;
+        case 29: return HV_REG_X29;
+        case 30: return HV_REG_X30;
+        case 31: return -1;
+    }
+
+}
 
 
 
