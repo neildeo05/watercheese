@@ -10,6 +10,8 @@
 #include <sys/mman.h>
 #include "watercheese_types.h"
 #include "io.h"
+#include "vcpu.h"
+#include <pthread.h>
 
 #include <Hypervisor/Hypervisor.h>
 
@@ -62,167 +64,32 @@ int InitMemory() {
 
 int main(int argc, const char * argv[])
 {
-    hv_vcpu_t vcpu;
+    int vmec = EXIT_FAILURE;
+    pthread_t vcpu_thread;
+    struct wc_vcpu_ctx vcpu0 = {
+        .vcpu_id =0,
+        .vmec = vmec
+    };
     // Contains exit reasons, I am assuming similar to the VMCS exit reasons
-    hv_vcpu_exit_t *vcpu_exit;
-
     hv_vm_create(NULL);
     if (InitMemory()) abort();
     if (InitIO()) abort();
     
     // Create a vCPU associated with the current host thread
-    hv_vcpu_create(&vcpu, &vcpu_exit, NULL);
-
-    // Set the P-state of the processor to be:
-    // 0x005 -> run at EL1
-    // 0x3C0 -> all interrupts masked initially
-    hv_vcpu_set_reg(vcpu, HV_REG_CPSR, 0x3c5);
-    hv_vcpu_set_reg(vcpu, HV_REG_PC, PAYLOAD_BASE);
-
-    hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SP_EL1, STACK_BASE + STACK_SIZE);
-
-    // Force BRK instructions to trap
-    hv_vcpu_set_trap_debug_exceptions(vcpu, true);
-
-    int vmec = EXIT_FAILURE;
-    // Infinite loop for the VM's runtime
-    for (;;) {
-        // This call blocks until the VM exits
-        // I am assuming it traps into EL2, the hypervisor/lowvisor in EL2 world switches to the VM context on this thread
-        hv_vcpu_run(vcpu);
-        
-        // Decoede the exit reason
-        if (vcpu_exit->reason == HV_EXIT_REASON_EXCEPTION) {
-            // ESR_EL2 contains the syndrome for an exception to EL2
-            excp_syndrome_t syndrome = vcpu_exit->exception.syndrome;
-            printf("Excepction Code: %x\n", EC(syndrome));
-            switch(EC(syndrome)) {
-                case EC_AA64_HVC: {
-                    uint64_t x0;
-                    hv_vcpu_get_reg(vcpu, HV_REG_X0, &x0);
-                    // TODO: handle the x0 boot contract thing
-                    if(x0 == 0x120) {
-                        // boot report
-                        break;
-                    } 
-                    else if (x0 == 0x121) {
-                        uint64_t x1, x2, x3;
-                        hv_vcpu_get_reg(vcpu, HV_REG_X1, &x1);
-                        hv_vcpu_get_reg(vcpu, HV_REG_X2, &x2);
-                        hv_vcpu_get_reg(vcpu, HV_REG_X3, &x3);
-                        if(x1 == DEFERRED_BASE + 0x1238 && x2 == x3) {
-                            break;
-                        }
-                        vmec = EXIT_FAILURE;
-                        goto exit;
-                    } 
-                    else if(x0 == 0x122) {
-                        vmec = EXIT_SUCCESS;
-                        goto exit;
-                    } 
-                    vmec = EXIT_FAILURE;
-                    goto exit;
-                }
-                case EC_AA64_SMC: {
-                    uint64_t pc;
-                    hv_vcpu_get_reg(vcpu, HV_REG_PC, &pc);
-                    pc += 4;
-                    hv_vcpu_set_reg(vcpu, HV_REG_PC, pc);
-                    break;
-                }
-                case EC_AA64_BKPT: {
-                    uint64_t x0;
-                    hv_vcpu_get_reg(vcpu, HV_REG_X0, &x0);
-                    printf("VM made an BRK call!\n");
-                    printf("Reg dump:\n");
-                    for (uint32_t reg = HV_REG_X0; reg < HV_REG_X5; reg++) {
-                        uint64_t s;
-                        hv_vcpu_get_reg(vcpu, reg, &s);
-                        printf("X%d: 0x%llx\n", reg, s);
-                    }
-                    vmec = EXIT_FAILURE;
-                    goto exit;
-                }
-                case EC_DATAABORT: {
-                    // need to check that it is inside deferred RAM and DFSC is a translation fault
-                    uint64_t pc;
-                    hv_vcpu_get_reg(vcpu, HV_REG_PC, &pc);
-                    uint64_t pa = vcpu_exit->exception.physical_address; // check faulting address
-                    uint8_t isv = ISV(syndrome);
-                    uint8_t s1ptw = S1PTW(syndrome);
-                    uint8_t cm = CM(syndrome);
-                    uint8_t dfsc = DFSC(syndrome);
-                    if((isv && !s1ptw && !cm) && dfsc >= 0x4 && dfsc <= 0x7) {
-                        // MMIO access
-                        uint64_t access_size = 1 << SAS(syndrome);
-                        uint64_t write_val = 0;
-                        uint8_t is_write = WnR(syndrome);
-                        uint64_t reg_idx = SRT(syndrome);
-                        if (is_write == 1 && reg_idx != 31) hv_vcpu_get_reg(vcpu, reg_idx_to_hv(reg_idx), &write_val);
-                        write_val &= (UINT64_MAX >> ((sizeof(uint64_t) - access_size) * 8));
-                        // valid mmio access fault
-                        struct wc_vcpu_mmio_exit mx = {
-                            .syndrome=syndrome,
-                            .fault_gpa=pa,
-                            .guest_pc=pc,
-                            .write_value=write_val,
-                            .vcpu_id=0,
-                            .access_size=access_size,
-                            .reg_idx=reg_idx,
-                            .direction=is_write
-                        };
-                        struct wc_mmio_result res = handle_mmio(&mx);
-                        if(res.status == WC_STATUS_SUCCESS) {
-                            if(!is_write) {
-                                uint64_t out = res.read_value;
-                                if(reg_idx != 31) {
-                                    uint64_t mask = UINT64_MAX >> ((8U - access_size) * 8U);
-                                    out &= mask;
-                                    hv_vcpu_set_reg(vcpu, reg_idx_to_hv(reg_idx), out);
-                                }
-                            }
-                            pc += 4;
-                            hv_vcpu_set_reg(vcpu, HV_REG_PC, &pc);
-                            break;
-                        }
-                    }
-                    fprintf(stderr, "Unexpected VM exception: 0x%llx, EC 0x%x, GVA 0x%llx, GPA 0x%llx\n",
-                        syndrome,
-                        EC(syndrome),
-                        vcpu_exit->exception.virtual_address,
-                        vcpu_exit->exception.physical_address
-                    );
-                    vmec = EXIT_FAILURE;
-                    goto exit;
-                }
-                default: {
-                    fprintf(stderr, "Unexpected VM exception: 0x%llx, EC 0x%x, GVA 0x%llx, GPA 0x%llx\n",
-                        syndrome,
-                        EC(syndrome),
-                        vcpu_exit->exception.virtual_address,
-                        vcpu_exit->exception.physical_address
-                    );
-                    vmec = EXIT_FAILURE;
-                    goto exit;
-                }
-            }
-        } 
-        else {
-            fprintf(stderr, "Unexpected VM exit reason: %d\n", vcpu_exit->reason);
-            vmec = EXIT_FAILURE;
-            goto exit;
-        }
+    if(pthread_create(&vcpu_thread, NULL, vcpu_worker, &vcpu0) != 0) {
+        fprintf(stderr, "pthread create failed");
+        hv_vm_destroy();
+        free(MainMemory);
+        return EXIT_FAILURE;
     }
-exit:
-    if(vmec) {
-        fprintf(stderr, "VM Failure! Exiting...");
-    } else {
-        fprintf(stdout, "Exiting..");
-    }
-    // unmap guest memory
-    hv_vcpu_destroy(vcpu);
-    hv_vm_destroy();
+    RunIOLoop();
+    pthread_join(vcpu_thread, NULL);
+    vmec = vcpu0.vmec;
+    if(vmec == EXIT_SUCCESS) fprintf(stdout, "Exitting...\n");
+    else fprintf(stderr, "VM Failure, exitting...\n");
+    DestroyIO();
     free(MainMemory);
-
+    hv_vm_destroy();
     return vmec;
+
 }

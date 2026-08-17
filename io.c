@@ -1,7 +1,17 @@
 #include "io.h"
 #include "uart.h"
 #include <unistd.h>
+#include <termios.h>
 #include "watercheese_types.h"
+#include <sys/event.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <stdio.h>
+#include <string.h>
+#include <util.h>
+
+
+
 
 static struct wc_mmio_region registry[WC_NUM_DEVICES];
 
@@ -26,16 +36,179 @@ static const struct wc_mmio_result RESULT_ERROR_DEVICE = {
 
 // Device interfaces
 static const struct wc_mmio_device_intf uart_dev_intf = {
+    .read=&uart_read,
     .write=&uart_write
 };
 
 
+static struct wc_uart uart = {
+    .dll=0, .dlm=0, .fcr=0, .ier=0, .lcr=0, .mcr=0, .scr=0, .tx_cnt=0, .tx_head=0, .tx_tail=0
+}; // static uart
+
+static struct wc_io_loop loop;
+static struct wc_char_backend_device backend_dev;
+
+int InitIOLoop() {
+    int kq;
+    if ((kq = kqueue()) == -1) {
+        perror("kqueue");
+        return -1;
+    }
+    struct kevent ev;
+    // register a user event called wc_io_wake, after it has been serviced, clear its state (re-use the event)
+    EV_SET(&ev, WC_IO_WAKE, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0, NULL);
+    if(kevent(kq, &ev, 1, NULL, 0, NULL) == -1) {
+        perror("kevent");
+        close(kq);
+        return -1;
+    }
+
+    loop.kq = kq;
+    atomic_init(&loop.stopping_flag, false);
+    return 0;
+}
+
+int RunIOLoop() {
+    // Get's populated when we switch back to the I/O thread if there are new events
+    struct kevent events[WC_IO_MAX_EVENTS];
+    while(!atomic_load(&loop.stopping_flag)) {
+        // wait indefinitely until the registered event becomes ready
+        int nev;
+        if((nev = kevent(loop.kq, NULL, 0, events, WC_IO_MAX_EVENTS, NULL)) == -1) {
+            if(errno == EINTR) continue;
+            perror("kevent");
+            return -1;
+        }
+
+        // StopIOLoop got called
+        if(atomic_load(&loop.stopping_flag)) break;
+
+        for(int i = 0; i < nev; i++) {
+            struct kevent* ev = &events[i];
+            if(ev->flags & EV_ERROR) {
+                return -1;
+            }
+            else if(ev->filter == EVFILT_USER && ev->ident == WC_IO_WAKE) {
+                ServiceTX(&backend_dev);
+            }
+            // ts the EWOULDBLOCK case ;(
+            else if(ev->filter == EVFILT_WRITE && ev->ident == backend_dev.fd) {
+                ServiceTX(&backend_dev);
+            }
+        }
+    }
+    return 0;
+}
+
+
+int WakeIOLoop() {
+    struct kevent ev;
+    // The already registered WC_IO_WAKE event should be triggered
+    EV_SET(&ev, WC_IO_WAKE, EVFILT_USER, 0, NOTE_TRIGGER, 0, NULL);
+    int ret = kevent(loop.kq, &ev, 1, NULL, 0, NULL);
+    if(ret == -1) return -1;
+    return 0;
+}
+int StopIOLoop() {
+    atomic_store(&loop.stopping_flag, 1);
+    return WakeIOLoop();
+}
+
+int InitCharBackend() {
+    // openpty(&master_fd, &slave)
+    if(openpty(&backend_dev.fd, &backend_dev.sfd, backend_dev.slave_name, NULL, NULL) == -1) {
+        perror("openpty");
+        return -1;
+    }
+
+    struct termios t;
+    if(tcgetattr(backend_dev.sfd, &t) == -1) {
+        perror("tcgetattr"); close(backend_dev.sfd); close(backend_dev.fd);
+        return -1;
+    }
+
+    cfmakeraw(&t);
+    if(tcsetattr(backend_dev.sfd, TCSANOW, &t) == -1) {
+        perror("tcsetattr"); close(backend_dev.sfd); close(backend_dev.fd);
+        return -1;
+    }
+    // backend_dev.fd = host_fd;
+    // make the host filedescriptor non blocking so our threads don't sleep for ts
+    int flags = fcntl(backend_dev.fd, F_GETFL, 0);
+    if (flags == -1) {
+        perror("fcntl getfl"); close(backend_dev.sfd); close(backend_dev.fd);
+        return -1;
+    }
+    if(fcntl(backend_dev.fd, F_SETFL, flags|O_NONBLOCK) == -1) {
+        perror("fcntl setfl"); close(backend_dev.sfd); close(backend_dev.fd);
+        return -1;
+    }
+    backend_dev.io_loop=&loop;
+    return 0;
+
+}
+
+void ServiceTX(struct wc_char_backend_device* backend_dev) {
+    struct wc_uart* uart = backend_dev->uart;
+    pthread_mutex_lock(&uart->uart_lock);
+    while(uart->tx_cnt > 0) {
+        uint8_t head_byte = uart->tx_fifo[uart->tx_head % WC_UART_FIFO_MAX_SIZE];
+        ssize_t ret = write(backend_dev->fd, &head_byte, 1);
+        if(ret < 0) {
+            if (errno == EWOULDBLOCK) {
+                struct kevent ev;
+                EV_SET(&ev, backend_dev->fd, EVFILT_WRITE, EV_ADD | EV_ENABLE, 0, 0, NULL);
+                if(kevent(loop.kq, &ev, 1, NULL, 0, NULL) == -1) {
+                    perror("kevent register");
+                    pthread_mutex_unlock(&uart->uart_lock);
+                    return;
+                }
+                pthread_mutex_unlock(&uart->uart_lock);
+                return;
+            }
+            if(errno == EINTR) {
+                continue;
+            }
+            else {
+                perror("backend write");
+                pthread_mutex_unlock(&uart->uart_lock);
+                return;
+            }
+        }
+        else if (ret == 0) {
+            fprintf(stderr, "Backend write not working...\n");
+            pthread_mutex_unlock(&uart->uart_lock);
+            return;
+        }
+        else {
+            uart->tx_head += ret;
+            uart->tx_cnt -= ret;
+        }
+    }
+    struct kevent ev;
+    EV_SET(&ev, backend_dev->fd, EVFILT_WRITE, EV_DISABLE, 0, 0, NULL);
+    kevent(loop.kq, &ev, 1, NULL, 0, NULL); // ENOENT is fine for us
+
+    pthread_mutex_unlock(&uart->uart_lock);
+
+}
+
 int InitIO() {
+    int ret = InitIOLoop();
+    if(ret < 0) return ret;
+    ret = InitCharBackend(STDOUT_FILENO);
+    if(ret < 0) return ret;
 
     registry[WC_UART].name = "UART";
     registry[WC_UART].base = UART_BASE;
     registry[WC_UART].size = UART_SIZE;
-    registry[WC_UART].device = uart_init(); // point to uart state table
+    if(pthread_mutex_init(&uart.uart_lock, NULL) != 0) {
+        perror("pthread mutex init");
+        return -1;
+    }
+    uart.backend_dev = &backend_dev;
+    backend_dev.uart = &uart;
+    registry[WC_UART].device = &uart; // point to uart state table
     registry[WC_UART].intf = &uart_dev_intf; // point to uart callback table
 
     registry[WC_RTC].name = "RTC"; 
@@ -77,7 +250,7 @@ struct wc_mmio_result handle_mmio(struct wc_vcpu_mmio_exit* mx) {
     if(mx->fault_gpa % mx->access_size != 0) return RESULT_ERROR_MISALIGNED;
     if(mmio_region->device == NULL || mmio_region->intf == NULL) return RESULT_ERROR_DEVICE;
     struct wc_mmio_access access = (struct wc_mmio_access) {.direction=mx->direction, .gpa=mx->fault_gpa, .offset=offset, .size=mx->access_size, .vcpu_id=mx->vcpu_id, .write_value=mx->write_value};
-    uint64_t out;
+    uint64_t out = -1;
     if(mx->direction) {
         return (struct wc_mmio_result) {.status=mmio_region->intf->write(mmio_region->device, &access), .read_value=-1};
     }

@@ -2,33 +2,10 @@
 #ifndef UART_H_
 #define UART_H_
 #include <stdint.h>
+#include <pthread.h>
 #include "io.h"
 
-/*
-struct uart_regs {
-    union {
-        char rbr; // DLAB=0 read
-        char thr; // DLAB=0 write
-        uint8_t dll; // DLAB=1
-    };
-    
-    union {
-        uint8_t ier; // DLAB=0
-        uint8_t dlm; // DLAB=1
-    };
-    
-    union {
-        uint8_t iir; // read
-        uint8_t fcr; // write
-    };
-
-    uint8_t lcr;
-    uint8_t mcr;
-    uint8_t lsr;
-    uint8_t msr;
-    uint8_t scr;
-};
-*/
+#define WC_UART_FIFO_MAX_SIZE 16
 #define REG_SHIFT 2
 #define UART_NUM_REGS 7
 #define OFFSET_TO_REGISTER(offset) offset >> REG_SHIFT
@@ -36,8 +13,10 @@ struct uart_regs {
 #define LSR_OE (1 << 1)
 #define LSR_DR (1 << 0)
 #define LSR_THRE (1 << 5)
+#define LSR_TEMT (1 << 6)
 #define IER_DRIE (1 << 0)
 #define IER_THREIE (1 << 1)
+
 
 struct wc_uart {
     uint8_t ier; // interrupt enable
@@ -48,7 +27,18 @@ struct wc_uart {
     uint8_t dll; // low
     uint8_t dlm; // hi
     uint8_t fcr; // fifo configuration register
-    int backend_fd; // backend file descriptor where the uart feeds to
+    
+    // TX FIFO
+    uint8_t tx_fifo[WC_UART_FIFO_MAX_SIZE];
+    uint8_t tx_head;
+    uint8_t tx_tail;
+    uint8_t tx_cnt;
+
+
+
+    struct wc_char_backend_device* backend_dev;
+    // TODO: make it lockless
+    pthread_mutex_t uart_lock;
 };
 
 
@@ -65,7 +55,9 @@ struct wc_uart {
 | `0x18` | `0x09000018` | MSR       | MSR       |
 | `0x1C` | `0x0900001C` | SCR       | SCR       |
 */
-enum mmio_status uart_write(struct wc_uart* device, struct wc_mmio_access* access);
+
+enum mmio_status uart_read(void* device, struct wc_mmio_access* access, uint64_t* value);
+enum mmio_status uart_write(void* device, struct wc_mmio_access* access);
 
 
 

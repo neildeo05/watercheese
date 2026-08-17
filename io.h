@@ -1,7 +1,10 @@
 #ifndef IO_H_
 #define IO_H_
 #include <stdint.h>
-
+#include <stdatomic.h>
+#define WC_IO_WAKE 42
+#define WC_IO_MAX_EVENTS 8
+#define WC_NAME_MAX 256
 enum mmio_type {
     WC_UNDEF,
     WC_GICD,
@@ -73,6 +76,22 @@ struct wc_mmio_region {
 };
 
 
+/// For I/O loop and backend devices
+struct wc_io_loop {
+    int kq; // kqueue descriptor
+    atomic_bool stopping_flag; // tells main loop when to exit
+};
+struct wc_char_backend_device {
+    int fd; // master FD for the PTY
+    int sfd; // sfd for the pty
+    char slave_name[WC_NAME_MAX];
+    struct wc_io_loop* io_loop; // global io loop
+    struct wc_uart* uart; // uart frontend
+};
+
+int InitIO();
+int RunIOLoop();
+int WakeIOLoop();
 struct wc_mmio_region* get_mmio_region(uintptr_t base);
 
 
