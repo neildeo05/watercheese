@@ -117,7 +117,7 @@ enum WC_ec_type {
     EC_AA64_BKPT              = 0x3c,
 };
 
-hv_reg_t reg_idx_to_hv(uint64_t reg_idx) {
+static inline hv_reg_t reg_idx_to_hv(uint64_t reg_idx) {
     switch(reg_idx) {
         case 0: return HV_REG_X0;
         case 1: return HV_REG_X1;
@@ -152,7 +152,7 @@ hv_reg_t reg_idx_to_hv(uint64_t reg_idx) {
         case 30: return HV_REG_X30;
         case 31: return -1;
     }
-
+    return -1;
 }
 
 

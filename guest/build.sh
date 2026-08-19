@@ -13,7 +13,7 @@ llvm-objcopy \
     hvf_guest.elf \
     hvf_guest.bin
 
-llvm-objdump \
-    -d \
-    --no-show-raw-insn \
-    hvf_guest.elf
+# llvm-objdump \
+#     -d \
+#     --no-show-raw-insn \
+#     hvf_guest.elf

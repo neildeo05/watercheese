@@ -90,8 +90,10 @@ struct wc_char_backend_device {
 };
 
 int InitIO();
+void DestroyIO();
 int RunIOLoop();
 int WakeIOLoop();
+int StopIOLoop();
 struct wc_mmio_region* get_mmio_region(uintptr_t base);
 
 

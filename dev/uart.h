@@ -56,8 +56,8 @@ struct wc_uart {
 | `0x1C` | `0x0900001C` | SCR       | SCR       |
 */
 
-enum mmio_status uart_read(void* device, struct wc_mmio_access* access, uint64_t* value);
-enum mmio_status uart_write(void* device, struct wc_mmio_access* access);
+enum mmio_status uart_read(void* device, const struct wc_mmio_access* access, uint64_t* value);
+enum mmio_status uart_write(void* device, const struct wc_mmio_access* access);
 
 
 

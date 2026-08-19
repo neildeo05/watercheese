@@ -6,7 +6,7 @@
 #include <assert.h>
 #include <errno.h>
 #include <unistd.h>
-#include "util.h"
+#include "wcutil.h"
 #include <sys/mman.h>
 #include "watercheese_types.h"
 #include "io.h"
@@ -40,7 +40,6 @@ int InitMemory() {
 
     memset(MainMemory, 0, RAM_SIZE);
 #if WC_CUSTOM_PAYLOAD
-    uintptr_t mm = (uintptr_t) MainMemory;
     uint8_t* code;
     char* payload_path = "guest/hvf_guest.bin";
     uint64_t codesz = read_payload(payload_path, &code);
@@ -62,7 +61,7 @@ int InitMemory() {
     return 0;
 }
 
-int main(int argc, const char * argv[])
+int main(void)
 {
     int vmec = EXIT_FAILURE;
     pthread_t vcpu_thread;

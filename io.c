@@ -48,6 +48,51 @@ static struct wc_uart uart = {
 static struct wc_io_loop loop;
 static struct wc_char_backend_device backend_dev;
 
+static void ServiceTX(struct wc_char_backend_device* backend_dev) {
+    struct wc_uart* uart = backend_dev->uart;
+    pthread_mutex_lock(&uart->uart_lock);
+    while(uart->tx_cnt > 0) {
+        uint8_t head_byte = uart->tx_fifo[uart->tx_head % WC_UART_FIFO_MAX_SIZE];
+        ssize_t ret = write(backend_dev->fd, &head_byte, 1);
+        if(ret < 0) {
+            if (errno == EWOULDBLOCK) {
+                struct kevent ev;
+                EV_SET(&ev, backend_dev->fd, EVFILT_WRITE, EV_ADD | EV_ENABLE, 0, 0, NULL);
+                if(kevent(loop.kq, &ev, 1, NULL, 0, NULL) == -1) {
+                    perror("kevent register");
+                    pthread_mutex_unlock(&uart->uart_lock);
+                    return;
+                }
+                pthread_mutex_unlock(&uart->uart_lock);
+                return;
+            }
+            if(errno == EINTR) {
+                continue;
+            }
+            else {
+                perror("backend write");
+                pthread_mutex_unlock(&uart->uart_lock);
+                return;
+            }
+        }
+        else if (ret == 0) {
+            fprintf(stderr, "Backend write not working...\n");
+            pthread_mutex_unlock(&uart->uart_lock);
+            return;
+        }
+        else {
+            uart->tx_head += ret;
+            uart->tx_cnt -= ret;
+        }
+    }
+    struct kevent ev;
+    EV_SET(&ev, backend_dev->fd, EVFILT_WRITE, EV_DISABLE, 0, 0, NULL);
+    kevent(loop.kq, &ev, 1, NULL, 0, NULL); // ENOENT is fine for us
+
+    pthread_mutex_unlock(&uart->uart_lock);
+
+}
+
 int InitIOLoop() {
     int kq;
     if ((kq = kqueue()) == -1) {
@@ -92,7 +137,7 @@ int RunIOLoop() {
                 ServiceTX(&backend_dev);
             }
             // ts the EWOULDBLOCK case ;(
-            else if(ev->filter == EVFILT_WRITE && ev->ident == backend_dev.fd) {
+            else if(ev->filter == EVFILT_WRITE && ev->ident == (uintptr_t) backend_dev.fd) {
                 ServiceTX(&backend_dev);
             }
         }
@@ -148,55 +193,12 @@ int InitCharBackend() {
 
 }
 
-void ServiceTX(struct wc_char_backend_device* backend_dev) {
-    struct wc_uart* uart = backend_dev->uart;
-    pthread_mutex_lock(&uart->uart_lock);
-    while(uart->tx_cnt > 0) {
-        uint8_t head_byte = uart->tx_fifo[uart->tx_head % WC_UART_FIFO_MAX_SIZE];
-        ssize_t ret = write(backend_dev->fd, &head_byte, 1);
-        if(ret < 0) {
-            if (errno == EWOULDBLOCK) {
-                struct kevent ev;
-                EV_SET(&ev, backend_dev->fd, EVFILT_WRITE, EV_ADD | EV_ENABLE, 0, 0, NULL);
-                if(kevent(loop.kq, &ev, 1, NULL, 0, NULL) == -1) {
-                    perror("kevent register");
-                    pthread_mutex_unlock(&uart->uart_lock);
-                    return;
-                }
-                pthread_mutex_unlock(&uart->uart_lock);
-                return;
-            }
-            if(errno == EINTR) {
-                continue;
-            }
-            else {
-                perror("backend write");
-                pthread_mutex_unlock(&uart->uart_lock);
-                return;
-            }
-        }
-        else if (ret == 0) {
-            fprintf(stderr, "Backend write not working...\n");
-            pthread_mutex_unlock(&uart->uart_lock);
-            return;
-        }
-        else {
-            uart->tx_head += ret;
-            uart->tx_cnt -= ret;
-        }
-    }
-    struct kevent ev;
-    EV_SET(&ev, backend_dev->fd, EVFILT_WRITE, EV_DISABLE, 0, 0, NULL);
-    kevent(loop.kq, &ev, 1, NULL, 0, NULL); // ENOENT is fine for us
 
-    pthread_mutex_unlock(&uart->uart_lock);
-
-}
 
 int InitIO() {
     int ret = InitIOLoop();
     if(ret < 0) return ret;
-    ret = InitCharBackend(STDOUT_FILENO);
+    ret = InitCharBackend();
     if(ret < 0) return ret;
 
     registry[WC_UART].name = "UART";
@@ -229,6 +231,12 @@ int InitIO() {
 
 
     return 0;
+
+}
+void DestroyIO() {
+    pthread_mutex_destroy(&uart.uart_lock);
+    close(backend_dev.sfd); close(backend_dev.fd);
+    close(loop.kq);
 
 }
 struct wc_mmio_region* get_mmio_region(uintptr_t base) {
