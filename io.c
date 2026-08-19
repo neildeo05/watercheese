@@ -177,7 +177,7 @@ int InitCharBackend() {
         perror("tcsetattr"); close(backend_dev.sfd); close(backend_dev.fd);
         return -1;
     }
-    // backend_dev.fd = host_fd;
+    fprintf(stderr, "Guest UART console: %s\n", backend_dev.slave_name);
     // make the host filedescriptor non blocking so our threads don't sleep for ts
     int flags = fcntl(backend_dev.fd, F_GETFL, 0);
     if (flags == -1) {
@@ -200,6 +200,7 @@ int InitIO() {
     if(ret < 0) return ret;
     ret = InitCharBackend();
     if(ret < 0) return ret;
+    while (getchar() != '\n');
 
     registry[WC_UART].name = "UART";
     registry[WC_UART].base = UART_BASE;

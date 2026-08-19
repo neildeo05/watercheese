@@ -169,9 +169,9 @@ void* vcpu_worker(void* ctp) {
     }
 exit:
     if(ctx->vmec) {
-        fprintf(stderr, "VM Failure! Exiting...");
+        fprintf(stderr, "VM Failure! Exiting...\n");
     } else {
-        fprintf(stdout, "Exiting..");
+        fprintf(stdout, "Exiting..\n");
     }
     StopIOLoop();
     hv_vcpu_destroy(vcpu);

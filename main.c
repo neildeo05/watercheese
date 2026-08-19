@@ -84,8 +84,6 @@ int main(void)
     RunIOLoop();
     pthread_join(vcpu_thread, NULL);
     vmec = vcpu0.vmec;
-    if(vmec == EXIT_SUCCESS) fprintf(stdout, "Exitting...\n");
-    else fprintf(stderr, "VM Failure, exitting...\n");
     DestroyIO();
     free(MainMemory);
     hv_vm_destroy();
