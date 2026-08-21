@@ -350,4 +350,4 @@ message:
      * CRLF is deliberate because the PTY slave is configured
      * raw, so the host tty layer will not translate '\n'.
      */
-    .asciz "Hello from WaterCheese UART!\r\nPTY transmit path works.\r\n"
+    .asciz "Hello my friendge its neils payload here"

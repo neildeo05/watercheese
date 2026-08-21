@@ -133,10 +133,11 @@ int RunIOLoop() {
             if(ev->flags & EV_ERROR) {
                 return -1;
             }
+            // WC_IO_WAKE is a user event that gets triggered when we want to service the backend
             else if(ev->filter == EVFILT_USER && ev->ident == WC_IO_WAKE) {
                 ServiceTX(&backend_dev);
             }
-            // ts the EWOULDBLOCK case ;(
+            // Idk if this is necessary, only happens if the backend device wouldblock on a write
             else if(ev->filter == EVFILT_WRITE && ev->ident == (uintptr_t) backend_dev.fd) {
                 ServiceTX(&backend_dev);
             }
