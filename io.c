@@ -125,6 +125,7 @@ int RunIOLoop() {
             return -1;
         }
 
+
         // StopIOLoop got called
         if(atomic_load(&loop.stopping_flag)) break;
 
