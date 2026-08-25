@@ -94,6 +94,8 @@ void DestroyIO();
 int RunIOLoop();
 int WakeIOLoop();
 int StopIOLoop();
+void BackendDevRxEnable();
+void BackendDevRxDisable();
 struct wc_mmio_region* get_mmio_region(uintptr_t base);
 
 

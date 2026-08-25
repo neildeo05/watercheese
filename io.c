@@ -57,6 +57,8 @@ static void ServiceTX(struct wc_char_backend_device* backend_dev) {
         if(ret < 0) {
             if (errno == EWOULDBLOCK) {
                 struct kevent ev;
+                // If we have a wouldblock on the service side, we add+enable a write event 
+                // this will come back to ServiceTX from the IO loop 
                 EV_SET(&ev, backend_dev->fd, EVFILT_WRITE, EV_ADD | EV_ENABLE, 0, 0, NULL);
                 if(kevent(loop.kq, &ev, 1, NULL, 0, NULL) == -1) {
                     perror("kevent register");
@@ -88,6 +90,47 @@ static void ServiceTX(struct wc_char_backend_device* backend_dev) {
     struct kevent ev;
     EV_SET(&ev, backend_dev->fd, EVFILT_WRITE, EV_DISABLE, 0, 0, NULL);
     kevent(loop.kq, &ev, 1, NULL, 0, NULL); // ENOENT is fine for us
+
+    pthread_mutex_unlock(&uart->uart_lock);
+
+}
+
+static void ServiceRX(struct wc_char_backend_device* backend_dev) {
+    struct wc_uart* uart = backend_dev->uart;
+
+    uint8_t need_disable = 0;
+    pthread_mutex_lock(&uart->uart_lock);
+    uint8_t cap = (uart->fcr & 1) ? WC_UART_FIFO_MAX_SIZE : 1;
+    while(uart->rx_cnt < cap) {
+        ssize_t ret = read(backend_dev->fd, &uart->rx_fifo[uart->rx_tail % WC_UART_FIFO_MAX_SIZE], 1);
+        if(ret < 0) {
+            if (errno == EWOULDBLOCK) {
+                // don't need to add the EVFILT_READ event to the kqueue cause its always there? i guess we just return
+                pthread_mutex_unlock(&uart->uart_lock);
+                return;
+            }
+            if(errno == EINTR) {
+                continue;
+            }
+            else {
+                perror("backend read");
+                pthread_mutex_unlock(&uart->uart_lock);
+                return;
+            }
+        }
+        else if (ret == 0) {
+            pthread_mutex_unlock(&uart->uart_lock);
+            return;
+        }
+        else {
+            uart->rx_tail += ret;
+            uart->rx_cnt += ret;
+        }
+    }
+    // hold the lock while disabling/enabling the backend device, because we don't want there to be a case where we make it readable/unreadable,
+    // and then switch back and make it the opposite of what it was, basically serialize the backend dev's readability
+    if(uart->rx_cnt == cap)
+        BackendDevRxDisable();
 
     pthread_mutex_unlock(&uart->uart_lock);
 
@@ -142,6 +185,9 @@ int RunIOLoop() {
             else if(ev->filter == EVFILT_WRITE && ev->ident == (uintptr_t) backend_dev.fd) {
                 ServiceTX(&backend_dev);
             }
+            else if(ev->filter == EVFILT_READ && ev->ident == (uintptr_t) backend_dev.fd) {
+                ServiceRX(&backend_dev);
+            }
         }
     }
     return 0;
@@ -190,9 +236,33 @@ int InitCharBackend() {
         perror("fcntl setfl"); close(backend_dev.sfd); close(backend_dev.fd);
         return -1;
     }
+    struct kevent ev;
+    EV_SET(&ev, backend_dev.fd, EVFILT_READ, EV_ADD | EV_ENABLE, 0, 0, NULL);
+    if(kevent(loop.kq, &ev, 1, NULL, 0, NULL) == -1) {
+        perror("kevent register");
+        return;
+    }
     backend_dev.io_loop=&loop;
     return 0;
 
+}
+
+void BackendDevRxEnable() {
+    struct kevent ev;
+    EV_SET(&ev, backend_dev.fd, EVFILT_READ, EV_ENABLE, 0, 0, NULL);
+    if(kevent(loop.kq, &ev, 1, NULL, 0, NULL) == -1) {
+        perror("kevent register");
+        return;
+    }
+}
+
+void BackendDevRxDisable() {
+    struct kevent ev;
+    EV_SET(&ev, backend_dev.fd, EVFILT_READ, EV_DISABLE, 0, 0, NULL);
+    if(kevent(loop.kq, &ev, 1, NULL, 0, NULL) == -1) {
+        perror("kevent register");
+        return;
+    }
 }
 
 

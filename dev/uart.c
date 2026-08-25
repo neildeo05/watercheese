@@ -6,7 +6,9 @@
 
 #define LCR_DLAB (1 << 7)
 #define FCR_EN (1 << 0)
-#define FCR_CLEAR (1 << 2)
+#define FCR_CLEAR_TX (1 << 2)
+#define FCR_CLEAR_RX (1 << 1)
+
 /*
       | Offset |          GPA | DLAB=0    | DLAB=1    |
       | -----: | -----------: | --------- | --------- |
@@ -28,9 +30,23 @@ enum mmio_status uart_read(void* device, const struct wc_mmio_access* access, ui
 
     switch (reg) {
         case 0: {
-            if (udevice->lcr & LCR_DLAB) result = udevice->dll;
-            else result = 0;
+            if (udevice->lcr & LCR_DLAB) { 
+                result = udevice->dll;
+                break;
+            } else {
+            size_t cap = (udevice->fcr & FCR_EN) ? WC_UART_FIFO_MAX_SIZE : 1;
+            uint8_t was_full = (udevice->rx_cnt >= cap);
+            if(udevice->rx_cnt == 0) {
+                result = 0;
+                break;
+            }
+            result = udevice->rx_fifo[udevice->rx_head];
+            udevice->rx_head = (udevice->rx_head + 1) % WC_UART_FIFO_MAX_SIZE;
+            udevice->rx_cnt--;
+            if(was_full)
+                BackendDevRxEnable();
             break;
+        }
         }
         case 1: {
             if (udevice->lcr & LCR_DLAB) result = udevice->dlm;
@@ -52,6 +68,7 @@ enum mmio_status uart_read(void* device, const struct wc_mmio_access* access, ui
 
         case 5:
             if (udevice->tx_cnt == 0) result |= (LSR_THRE | LSR_TEMT);
+            if (udevice->rx_cnt > 0) result |= LSR_DR;
             break;
 
         case 6:
@@ -108,12 +125,30 @@ enum mmio_status uart_write(void* device, const struct wc_mmio_access* access) {
         break;
     }
     case 2: {
-        if(write_val & FCR_CLEAR) {
+        uint8_t fifo_status_changed = ((udevice->fcr & FCR_EN) != (write_val & FCR_EN));
+        if(fifo_status_changed) {
+            udevice->rx_head = 0;
+            udevice->rx_tail = 0;
+            udevice->rx_cnt = 0; 
+            BackendDevRxEnable();
+            udevice->tx_head = 0;
+            udevice->tx_tail = 0;
+            udevice->tx_cnt = 0; 
+
+        }
+        if(write_val & FCR_CLEAR_TX) {
             udevice->tx_head = 0;
             udevice->tx_tail = 0;
             udevice->tx_cnt = 0;
         }
-        udevice->fcr = write_val & FCR_EN;
+        if(write_val & FCR_CLEAR_RX) {
+            udevice->rx_head = 0;
+            udevice->rx_tail = 0;
+            udevice->rx_cnt = 0; 
+            BackendDevRxEnable();
+
+        }
+        udevice->fcr = write_val & FCR_EN; // we don't store the clear bit in the internal uart repr
         break;
     }
     case 3: {
@@ -143,7 +178,6 @@ enum mmio_status uart_write(void* device, const struct wc_mmio_access* access) {
     }
     pthread_mutex_unlock(&udevice->uart_lock);
     if(request_tx) {
-        // TODO: request tx service from the character backend
         WakeIOLoop();
     }
 

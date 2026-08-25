@@ -14,6 +14,7 @@
 #define LSR_DR (1 << 0)
 #define LSR_THRE (1 << 5)
 #define LSR_TEMT (1 << 6)
+#define LSR_DR (1 << 0)
 #define IER_DRIE (1 << 0)
 #define IER_THREIE (1 << 1)
 
@@ -33,6 +34,12 @@ struct wc_uart {
     uint8_t tx_head;
     uint8_t tx_tail;
     uint8_t tx_cnt;
+
+    // RX Fifo
+    uint8_t rx_fifo[WC_UART_FIFO_MAX_SIZE];
+    uint8_t rx_head;
+    uint8_t rx_tail;
+    uint8_t rx_cnt;
 
 
 
