@@ -1,4 +1,3 @@
-// Built from https://gist.github.com/imbushuo/51b09e61ecd7b7ac063853ad65cedf34
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -37,9 +36,7 @@ int InitMemory() {
     if (err != 0 || MainMemory == NULL) {
         return -ENOMEM;
     }
-
     memset(MainMemory, 0, RAM_SIZE);
-#if WC_CUSTOM_PAYLOAD
     uint8_t* code;
     char* payload_path = "guest/hvf_guest.bin";
     uint64_t codesz = read_payload(payload_path, &code);
@@ -52,12 +49,6 @@ int InitMemory() {
     // we map all of main memory as RWX because so the guest can control the permissions themselves
     // if a guest application accesses a region that it doesn't have permissions to do the OS should fault
     hv_vm_map(MainMemory, RAM_BASE, RAM_SIZE, HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC);
-
-
-#else
-    hv_vm_map(MainMemory, RAM_BASE, RAM_SIZE, HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC);
-#endif
-
     return 0;
 }
 
