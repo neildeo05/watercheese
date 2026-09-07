@@ -290,6 +290,8 @@ int InitIO() {
     registry[WC_RTC].base = RTC_BASE; 
     registry[WC_RTC].size = RTC_SIZE; 
 
+    // GICD and GICR are implemented using Apple's virtual GIC. Therefore, accesses to the GICD region should _never_ cause a vmexit
+    // We keep them in the registry, but they are not valid devices
     registry[WC_GICD].name = "GICD"; 
     registry[WC_GICD].base = GICD_BASE; 
     registry[WC_GICD].size = GICD_SIZE; 
@@ -314,8 +316,8 @@ void DestroyIO() {
 }
 struct wc_mmio_region* get_mmio_region(uintptr_t base) {
     // GICD
-    if (base >= GICD_BASE && base < GICD_BASE + GICD_SIZE) return &registry[WC_GICD];
-    if (base >= GICR_BASE && base < GICR_BASE + GICR_SIZE) return &registry[WC_GICR];
+    // if (base >= GICD_BASE && base < GICD_BASE + GICD_SIZE) return &registry[WC_GICD];
+    // if (base >= GICR_BASE && base < GICR_BASE + GICR_SIZE) return &registry[WC_GICR];
     if (base >= UART_BASE && base < UART_BASE + UART_SIZE) return &registry[WC_UART];
     if (base >= RTC_BASE && base < RTC_BASE + RTC_SIZE) return &registry[WC_RTC];
     if (base >= VIRTIO_BASE && base < VIRTIO_BASE + VIRTIO_SIZE) return &registry[WC_VIRTIO];
